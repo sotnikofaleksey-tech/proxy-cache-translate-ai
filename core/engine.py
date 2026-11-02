@@ -239,30 +239,67 @@ _HOP_BY_HOP = frozenset({
 
 
 def _forward_headers(request: Request, upstream_api_key: str) -> dict[str, str]:
-    """Forward incoming headers, injecting Bearer auth when missing."""
+    """Forward incoming headers, injecting Bearer auth when missing or dropping empty dummy auth."""
     out: dict[str, str] = {}
     has_auth = False
+    clean_key = (upstream_api_key or "").strip()
+
     for key, value in request.headers.items():
         low = key.lower()
         if low in _HOP_BY_HOP: continue
-        out[key] = value
-        if low == "authorization": has_auth = True
-    if not has_auth and upstream_api_key:
-        out["Authorization"] = f"Bearer {upstream_api_key}"
+        val = value.strip()
+        if low == "authorization":
+            parts = val.split(None, 1)
+            token = parts[1].strip() if len(parts) > 1 else ""
+            if not token:
+                if clean_key:
+                    out[key] = f"Bearer {clean_key}"
+                    has_auth = True
+                # Else: drop empty dummy Bearer header so h11 and local LLMs won't reject it
+                continue
+            has_auth = True
+            out[key] = val
+        else:
+            out[key] = val
+
+    if not has_auth and clean_key:
+        out["Authorization"] = f"Bearer {clean_key}"
     return out
 
 
 def _forward_headers_anthropic(request: Request, upstream_api_key: str) -> dict[str, str]:
-    """Forward headers for Anthropic/Messages API, including x-api-key and anthropic-version."""
+    """Forward headers for Anthropic/Messages API, dropping empty dummy auth or injecting key."""
     out: dict[str, str] = {}
     has_auth = False
+    clean_key = (upstream_api_key or "").strip()
+
     for key, value in request.headers.items():
         low = key.lower()
         if low in _HOP_BY_HOP: continue
-        out[key] = value
-        if low in ("authorization", "x-api-key"): has_auth = True
-    if not has_auth and upstream_api_key:
-        out["x-api-key"] = upstream_api_key
+        val = value.strip()
+        if low == "authorization":
+            parts = val.split(None, 1)
+            token = parts[1].strip() if len(parts) > 1 else ""
+            if not token:
+                if clean_key:
+                    out[key] = f"Bearer {clean_key}"
+                    has_auth = True
+                continue
+            has_auth = True
+            out[key] = val
+        elif low == "x-api-key":
+            if not val:
+                if clean_key:
+                    out[key] = clean_key
+                    has_auth = True
+                continue
+            has_auth = True
+            out[key] = val
+        else:
+            out[key] = val
+
+    if not has_auth and clean_key:
+        out["x-api-key"] = clean_key
     return out
 
 
