@@ -1449,6 +1449,24 @@ class ProxyStationApp(ctk.CTk):
             self.drip_switch.select()
         self.drip_switch.pack(anchor="w", padx=24, pady=(0, 20))
 
+        # Карта 1c: Авто-расстановка Prompt Cache (85-95%)
+        card_cache = ctk.CTkFrame(scroll, fg_color=COL_CARD, corner_radius=16, border_color=COL_BORDER, border_width=1)
+        card_cache.pack(fill="x", pady=8)
+
+        ctk.CTkLabel(card_cache, text="⚡ Авто-расстановка Prompt Cache (85–95%)", font=ctk.CTkFont("Segoe UI", 16, "bold"), text_color=COL_TEXT_BRIGHT).pack(anchor="w", padx=24, pady=(20, 6))
+        ctk.CTkLabel(
+            card_cache,
+            text="Автоматически внедряет контрольные точки кэширования (cache_control: ephemeral) в системные промпты,\nсписок инструментов (tools) и границу истории диалога для Claude и совместимых моделей.\nОбеспечивает 85–95% попадания в кэш провайдера и максимальную скорость первого токена.",
+            font=ctk.CTkFont("Segoe UI", 12), text_color=COL_MUTED, justify="left",
+        ).pack(anchor="w", padx=24, pady=(0, 10))
+        self.cache_switch = ctk.CTkSwitch(
+            card_cache, text="Автоматически расставлять точки кэша (Anthropic / OmniRoute)", font=ctk.CTkFont("Segoe UI", 13),
+            text_color=COL_TEXT, progress_color=COL_GREEN,
+        )
+        if getattr(t, "auto_prompt_cache", True):
+            self.cache_switch.select()
+        self.cache_switch.pack(anchor="w", padx=24, pady=(0, 20))
+
         # Карта 2: Поведение окна
         card2 = ctk.CTkFrame(scroll, fg_color=COL_CARD, corner_radius=16, border_color=COL_BORDER, border_width=1)
         card2.pack(fill="x", pady=14)
@@ -1543,6 +1561,7 @@ class ProxyStationApp(ctk.CTk):
         t.primary_model = self.set_prim.get().strip()
         t.backup_model = self.set_back.get().strip()
         t.smooth_drip = bool(self.drip_switch.get())
+        t.auto_prompt_cache = bool(self.cache_switch.get())
 
         mode_text = self.close_mode_menu.get()
         if "трей" in mode_text:

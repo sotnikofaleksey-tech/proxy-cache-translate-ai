@@ -243,6 +243,7 @@ class ProxyController:
         app = create_proxy_app(
             asdict(entry), translator=translator, store=store,
             smooth_drip=self.config.translation.smooth_drip,
+            auto_prompt_cache=getattr(self.config.translation, "auto_prompt_cache", True),
         )
 
         uv_cfg = uvicorn.Config(

@@ -72,6 +72,7 @@ class TranslationSettings:
     primary_model: str = 'gemini-3.5-flash-lite'
     backup_model: str = 'gemini-3.8-flash'
     smooth_drip: bool = True   # плавная пословная выдача перевода (а-ля генерация)
+    auto_prompt_cache: bool = True  # автоматическая расстановка точек кэширования (85-95% hit rate)
 
 
 @dataclass

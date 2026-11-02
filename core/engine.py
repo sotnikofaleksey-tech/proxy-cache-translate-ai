@@ -41,6 +41,7 @@ def create_proxy_app(
     store: ShadowStore | None,
     *,
     smooth_drip: bool = True,
+    auto_prompt_cache: bool = True,
 ) -> FastAPI:
     """Build a self-contained FastAPI app for one proxy endpoint."""
 
@@ -109,7 +110,7 @@ def create_proxy_app(
         raw_model = body.get("model", "")
         body["model"] = model_aliases.get(raw_model, raw_model)
         stream = body.get("stream", False)
-        session_id = _session_id(body)
+        session_id = _session_id(body, request)
         prefix_matched = False
         prompt_en: str | None = None
         if translate_enabled and translator and store and not bypass:
@@ -132,14 +133,16 @@ def create_proxy_app(
         raw_model = body.get("model", "")
         body["model"] = model_aliases.get(raw_model, raw_model)
         stream = body.get("stream", False)
-        session_id = _session_id(body)
+        session_id = _session_id(body, request)
         prefix_matched = False
         prompt_en: str | None = None
         if translate_enabled and translator and store and not bypass:
             messages = body.get("messages", [])
             messages, prefix_matched, prompt_en = await build_request(messages, store, translator, session_id)
             body["messages"] = messages
-        fwd_headers = _forward_headers_anthropic(request, upstream_api_key)
+        if auto_prompt_cache:
+            body = _inject_anthropic_cache_control(body)
+        fwd_headers = _forward_headers_anthropic(request, upstream_api_key, auto_prompt_cache=auto_prompt_cache)
         resp_headers: dict[str, str] = {"x-shadow-upstream": upstream_url}
         if prefix_matched: resp_headers["x-shadow-prefix-matched"] = "true"
         timeout = _TIMEOUT_STREAM if stream else _TIMEOUT_NORMAL
@@ -267,8 +270,8 @@ def _forward_headers(request: Request, upstream_api_key: str) -> dict[str, str]:
     return out
 
 
-def _forward_headers_anthropic(request: Request, upstream_api_key: str) -> dict[str, str]:
-    """Forward headers for Anthropic/Messages API, dropping empty dummy auth or injecting key."""
+def _forward_headers_anthropic(request: Request, upstream_api_key: str, auto_prompt_cache: bool = True) -> dict[str, str]:
+    """Forward headers for Anthropic/Messages API, dropping empty dummy auth or injecting key, with auto prompt cache beta."""
     out: dict[str, str] = {}
     has_auth = False
     clean_key = (upstream_api_key or "").strip()
@@ -300,6 +303,14 @@ def _forward_headers_anthropic(request: Request, upstream_api_key: str) -> dict[
 
     if not has_auth and clean_key:
         out["x-api-key"] = clean_key
+
+    if auto_prompt_cache:
+        current_beta = out.get("anthropic-beta", "")
+        betas = [b.strip() for b in current_beta.split(",") if b.strip()]
+        if "prompt-caching-2024-07-31" not in betas:
+            betas.append("prompt-caching-2024-07-31")
+        out["anthropic-beta"] = ", ".join(betas)
+
     return out
 
 
@@ -315,16 +326,31 @@ async def _parse_body(request: Request) -> dict[str, Any]:
     return json.loads(text)
 
 
-def _session_id(body: dict[str, Any]) -> str:
-    """Derive a stable session key from the request body (system + first user msg)."""
+def _session_id(body: dict[str, Any], request: Request | None = None) -> str:
+    """Derive a stable session key from request headers, session_id or body content."""
+    if request:
+        for hdr in ("x-session-id", "x-conversation-id", "conversation-id", "session-id"):
+            val = request.headers.get(hdr)
+            if val and val.strip():
+                return val.strip()
+
     if "session_id" in body:
         return str(body["session_id"])
-    msgs = body.get("messages", [])
+    if "conversation_id" in body:
+        return str(body["conversation_id"])
+
     parts: list[str] = []
+    sys_field = body.get("system")
+    if sys_field:
+        t = content_to_text(sys_field).strip()
+        if t:
+            parts.append("S:" + t[:200])
+
+    msgs = body.get("messages", [])
     for m in msgs:
         r = m.get("role", "")
         t = content_to_text(m.get("content", "")).strip()
-        if r == "system" and t:
+        if r == "system" and t and not sys_field:
             parts.append("S:" + t[:200])
         elif r == "user" and t:
             parts.append("U:" + t[:200])
@@ -334,6 +360,75 @@ def _session_id(body: dict[str, Any]) -> str:
         h = hashlib.sha256("\n".join(parts).encode("utf-8", "ignore")).hexdigest()[:12]
         return f"sess-{h}"
     return "default"
+
+
+def _inject_anthropic_cache_control(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    Automatically inject Anthropic prompt caching breakpoints (cache_control: {"type": "ephemeral"})
+    to achieve 85%-95% cache hit rates on multi-turn conversations.
+
+    Anthropic supports up to 4 cache_control breakpoints per request:
+      1. System prompt (caches system instructions, skills, agent definitions)
+      2. Tools (caches tool definitions)
+      3. Penultimate message (caches the entire conversation history up to the current turn)
+    """
+    # 1. System prompt breakpoint
+    sys_val = body.get("system")
+    if sys_val:
+        if isinstance(sys_val, str) and sys_val.strip():
+            body["system"] = [
+                {
+                    "type": "text",
+                    "text": sys_val,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        elif isinstance(sys_val, list) and sys_val:
+            has_cc = any(isinstance(b, dict) and "cache_control" in b for b in sys_val)
+            if not has_cc:
+                for b in reversed(sys_val):
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        b["cache_control"] = {"type": "ephemeral"}
+                        break
+
+    # 2. Tools breakpoint
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        has_tool_cc = any(isinstance(t, dict) and "cache_control" in t for t in tools)
+        if not has_tool_cc:
+            last_tool = tools[-1]
+            if isinstance(last_tool, dict):
+                last_tool["cache_control"] = {"type": "ephemeral"}
+
+    # 3. Conversation history breakpoint (penultimate message)
+    msgs = body.get("messages")
+    if isinstance(msgs, list) and len(msgs) >= 2:
+        cc_count = 0
+        for m in msgs:
+            c = m.get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and "cache_control" in b:
+                        cc_count += 1
+
+        if cc_count == 0:
+            target = msgs[-2]
+            c = target.get("content")
+            if isinstance(c, str):
+                target["content"] = [
+                    {
+                        "type": "text",
+                        "text": c,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            elif isinstance(c, list) and c:
+                for b in reversed(c):
+                    if isinstance(b, dict) and b.get("type") in ("text", "tool_result"):
+                        b["cache_control"] = {"type": "ephemeral"}
+                        break
+
+    return body
 
 
 # =============================================================================
