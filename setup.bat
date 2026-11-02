@@ -1,96 +1,77 @@
 @echo off
-setlocal EnableDelayedExpansion
-chcp 65001 >nul
-title Portable Proxy — Setup / Repair
+setlocal
 cd /d "%~dp0"
+title Proxy Station - Setup / Repair
 
-echo ╔══════════════════════════════════════════════════════╗
-echo ║       PORTABLE PROXY — ONE-TIME SETUP               ║
-echo ╚══════════════════════════════════════════════════════╝
+echo ============================================================
+echo   PROXY STATION - ONE-TIME SETUP (needs internet, ~60 MB)
+echo ============================================================
+echo.
+echo This installs a private copy of Python 3.11 INTO THIS FOLDER (python\).
+echo Nothing is installed system-wide and no admin rights are needed.
 echo.
 
-:: ─── Step 1: Download Python 3.11.9 embeddable ─────────────────────────
+rem --- 1. Python 3.11.9 with tkinter (extracted from the official MSI packages) ---
+rem     (the "embeddable" zip has no tkinter, so the GUI could never start with it)
 if exist "python\python.exe" (
-    echo [OK] Python runtime already present in python\ — skipping download.
-    goto :patch_pth
+    "python\python.exe" -c "import tkinter, ssl, sqlite3" >nul 2>&1
+    if not errorlevel 1 (
+        echo [OK] Python runtime already present - skipping download.
+        goto install_pip
+    )
+    echo [INFO] Existing python\ is incomplete - rebuilding it.
+    rmdir /s /q "python"
 )
 
-echo [1/6] Downloading Python 3.11.9 embeddable (amd64)...
-powershell -NoProfile -Command ^
-    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
-    "Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip' " ^
-    "-OutFile 'python-embed.zip' -UseBasicParsing"
+if exist "_setup" rmdir /s /q "_setup"
+mkdir "_setup"
 
-if not exist "python-embed.zip" (
-    echo [ERROR] Failed to download Python. Check your internet connection.
+echo [1/4] Downloading Python 3.11.9 packages from python.org ...
+for %%M in (core exe lib tcltk) do (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/amd64/%%M.msi' -OutFile '_setup\%%M.msi' -UseBasicParsing"
+    if not exist "_setup\%%M.msi" (
+        echo [ERROR] Download of %%M.msi failed. Check your internet connection and run setup.bat again.
+        rmdir /s /q "_setup"
+        pause
+        exit /b 1
+    )
+)
+
+echo [2/4] Unpacking into python\ ...
+for %%M in (core exe lib tcltk) do (
+    start /wait "" msiexec /a "%~dp0_setup\%%M.msi" /qn TARGETDIR="%~dp0python"
+)
+if exist "python\*.msi" del /q "python\*.msi"
+rmdir /s /q "_setup"
+
+"python\python.exe" -c "import tkinter, ssl, sqlite3" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Python was unpacked but is not working. Delete the python\ folder and run setup.bat again.
     pause
     exit /b 1
 )
 
-:: ─── Step 2: Extract ────────────────────────────────────────────────────
-echo [2/6] Extracting to python\ ...
-if exist "python" rmdir /s /q "python"
-powershell -NoProfile -Command ^
-    "Expand-Archive -Path 'python-embed.zip' -DestinationPath 'python' -Force"
-
-if not exist "python\python.exe" (
-    echo [ERROR] Extraction failed.
-    pause
-    exit /b 1
-)
-
-:patch_pth
-:: ─── Step 3: Patch python311._pth to enable site-packages & parent dir ──
-echo [3/6] Configuring python\python311._pth ...
-powershell -NoProfile -Command ^
-    "$content = @('python311.zip', '.', '..', 'Lib', 'Lib\site-packages', 'import site') -join \"`r`n\"; " ^
-    "Set-Content -Path 'python\python311._pth' -Value $content -Encoding ASCII"
-
-:: ─── Step 4: Download get-pip.py ────────────────────────────────────────
-if exist "python\Scripts\pip.exe" (
-    echo [OK] pip already installed — skipping.
-    goto :install_deps
-)
-
-echo [4/6] Downloading get-pip.py ...
-powershell -NoProfile -Command ^
-    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
-    "Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' " ^
-    "-OutFile 'get-pip.py' -UseBasicParsing"
-
-if not exist "get-pip.py" (
-    echo [ERROR] Failed to download get-pip.py.
-    pause
-    exit /b 1
-)
-
-:: ─── Step 5: Install pip ────────────────────────────────────────────────
-echo [5/6] Installing pip ...
-"python\python.exe" get-pip.py --no-warn-script-location
+:install_pip
+echo [3/4] Installing pip ...
+"python\python.exe" -m ensurepip --upgrade --default-pip >nul 2>&1
+"python\python.exe" -m pip --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] pip installation failed.
     pause
     exit /b 1
 )
 
-:install_deps
-:: ─── Step 6: Install dependencies ───────────────────────────────────────
-echo [6/6] Installing dependencies (fastapi, uvicorn, httpx, customtkinter) ...
-"python\python.exe" -m pip install --no-warn-script-location fastapi "uvicorn[standard]" httpx customtkinter pystray Pillow
+echo [4/4] Installing dependencies (fastapi, uvicorn, httpx, customtkinter, pystray, Pillow) ...
+"python\python.exe" -m pip install --no-warn-script-location --disable-pip-version-check fastapi "uvicorn[standard]" httpx customtkinter pystray Pillow
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed.
     pause
     exit /b 1
 )
 
-:: ─── Cleanup ────────────────────────────────────────────────────────────
-if exist "python-embed.zip" del /q "python-embed.zip"
-if exist "get-pip.py"       del /q "get-pip.py"
-
 echo.
-echo ╔══════════════════════════════════════════════════════╗
-echo ║  Setup complete!                                     ║
-echo ║  Run proxy.bat to start the Portable Proxy Manager.  ║
-echo ╚══════════════════════════════════════════════════════╝
+echo ============================================================
+echo   Setup complete. Run proxy.bat to start Proxy Station.
+echo ============================================================
 echo.
 pause

@@ -44,7 +44,7 @@ Measured on a real working session (Claude via an Anthropic-compatible gateway, 
 ## 🚀 Quick start
 
 1. Download or clone this repository.
-2. Run **`setup.bat`** once – it downloads a private embeddable Python 3.11 into `python\` and installs the dependencies (needs internet).
+2. Run **`setup.bat`** once – it downloads a private copy of Python 3.11 (with tkinter) into `python\` and installs the dependencies. Needs internet (~60 MB); no admin rights, nothing is installed system-wide.
 3. Run **`proxy.bat`** – the GUI opens (no console window).
 4. In **Settings**, point the translator to a fast OpenAI-compatible LLM endpoint and pick the models.
 5. Create a gateway (upstream URL, port, language), then point your AI client at `http://127.0.0.1:<port>`.
@@ -54,7 +54,7 @@ Measured on a real working session (Claude via an Anthropic-compatible gateway, 
 | `proxy.bat` | Start the GUI (`proxy.bat --cli` for the console menu) |
 | `proxy_cli.bat` | Console menu |
 | `start_headless.bat` | Run all gateways without a UI |
-| `stop_all.bat` | Force-stop every configured gateway port |
+| `stop_all.bat` | Stop Proxy Station (only processes started from this folder – other programs are never touched) |
 | `setup.bat` | Install / repair the bundled Python |
 
 ## 🔒 Where your data lives
@@ -64,7 +64,8 @@ The program folder contains **no settings, keys or caches**. Everything is store
 ```
 %LOCALAPPDATA%\ProxyStation\
 ├── config\proxies.json     # gateways, translator settings (API keys, plain text!)
-└── cache\                  # shadow cache and phrase dictionary (*.jsonl)
+├── cache\                  # shadow cache and phrase dictionary (*.jsonl)
+└── logs\proxystation.log   # diagnostics (the GUI runs without a console window)
 ```
 
 Keep that folder private. The repository itself never contains your configuration.
@@ -74,6 +75,12 @@ Keep that folder private. The repository itself never contains your configuratio
 `GET /health` · `GET /stats` · `POST /cache/reset` · `GET /v1/models` (provider models + your aliases) · `POST /v1/chat/completions` · `POST /v1/messages`
 
 Send header `x-shadow-bypass: true` to skip translation for a single request.
+
+## 🛠️ Troubleshooting
+
+- **Nothing happens / window closes** – open `%LOCALAPPDATA%\ProxyStation\logs\proxystation.log`; if you never ran `setup.bat`, `proxy.bat` runs it automatically.
+- **"Proxy Station is already running"** – only one instance (GUI, console or headless) may run at a time. Look for the tray icon, or run `stop_all.bat`.
+- **"Port N is occupied by another program"** – Proxy Station never kills foreign programs. Close that program or change the gateway's port. (Leftover Proxy Station processes of this folder are cleaned up automatically.)
 
 ## ⚠️ Current limitations
 
@@ -137,7 +144,7 @@ Proxy Station решает это:
 ### 🚀 Быстрый старт
 
 1. Скачайте или клонируйте репозиторий.
-2. Один раз запустите **`setup.bat`** – он скачает собственный встраиваемый Python 3.11 в папку `python\` и поставит зависимости (нужен интернет).
+2. Один раз запустите **`setup.bat`** – он скачает собственную копию Python 3.11 (с tkinter) в папку `python\` и поставит зависимости. Нужен интернет (~60 МБ); права администратора не нужны, в систему ничего не устанавливается.
 3. Запустите **`proxy.bat`** – откроется окно программы (без консоли).
 4. В **Настройках** укажите быстрый OpenAI-совместимый LLM-эндпоинт для перевода и модели.
 5. Создайте шлюз (URL апстрима, порт, язык) и направьте ваш ИИ-клиент на `http://127.0.0.1:<порт>`.
@@ -147,7 +154,7 @@ Proxy Station решает это:
 | `proxy.bat` | Запуск GUI (`proxy.bat --cli` – консольное меню) |
 | `proxy_cli.bat` | Консольное меню |
 | `start_headless.bat` | Все шлюзы без интерфейса |
-| `stop_all.bat` | Принудительно остановить порты всех шлюзов |
+| `stop_all.bat` | Остановить Proxy Station (только процессы из этой папки – чужие программы не трогает) |
 | `setup.bat` | Установка / восстановление встроенного Python |
 
 ### 🔒 Где хранятся ваши данные
@@ -157,7 +164,8 @@ Proxy Station решает это:
 ```
 %LOCALAPPDATA%\ProxyStation\
 ├── config\proxies.json     # шлюзы и настройки переводчика (API-ключи, открытым текстом!)
-└── cache\                  # теневой кэш и словарь фраз (*.jsonl)
+├── cache\                  # теневой кэш и словарь фраз (*.jsonl)
+└── logs\proxystation.log   # диагностика (GUI работает без окна консоли)
 ```
 
 Держите эту папку в секрете. В репозиторий ваша конфигурация не попадает.
@@ -167,6 +175,12 @@ Proxy Station решает это:
 `GET /health` · `GET /stats` · `POST /cache/reset` · `GET /v1/models` (модели провайдера + ваши алиасы) · `POST /v1/chat/completions` · `POST /v1/messages`
 
 Заголовок `x-shadow-bypass: true` отключает перевод для одного запроса.
+
+### 🛠️ Если что-то не работает
+
+- **Ничего не происходит / окно закрывается** – откройте `%LOCALAPPDATA%\ProxyStation\logs\proxystation.log`; если `setup.bat` не запускался, `proxy.bat` выполнит его сам.
+- **«Proxy Station уже запущен»** – запущен может быть только один экземпляр (GUI, консоль или headless). Найдите значок в трее или запустите `stop_all.bat`.
+- **«Порт N занят другой программой»** – Proxy Station никогда не убивает чужие программы. Закройте её или смените порт шлюза. (Остатки самого Proxy Station из этой папки очищаются автоматически.)
 
 ### ⚠️ Текущие ограничения
 

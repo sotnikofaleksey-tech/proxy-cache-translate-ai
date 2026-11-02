@@ -1803,9 +1803,6 @@ class ProxyStationApp(ctk.CTk):
 
         self.ctrl.stop_all()
 
-        for p in self.ctrl.config.proxies:
-            self.ctrl.free_port(p.listen_port)
-
         try:
             self.tray_icon.stop()
         except Exception:
@@ -1820,6 +1817,11 @@ class ProxyStationApp(ctk.CTk):
 
 
 def main() -> None:
+    from core import instance
+
+    if not instance.acquire():
+        instance.notify_already_running(gui=True)
+        return
     app = ProxyStationApp()
     app.mainloop()
 

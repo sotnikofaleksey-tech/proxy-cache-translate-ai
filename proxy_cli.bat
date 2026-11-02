@@ -1,7 +1,12 @@
 @echo off
-chcp 65001 >nul
-title Proxy Station — Console Menu
 cd /d "%~dp0"
+title Proxy Station - Console
+
+if not exist "python\python.exe" (
+    echo [INFO] Bundled Python not found - running first-time setup...
+    call "%~dp0setup.bat"
+    if not exist "python\python.exe" exit /b 1
+)
 
 "%~dp0python\python.exe" -m core.manager %*
 pause

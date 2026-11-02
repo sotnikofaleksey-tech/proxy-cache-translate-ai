@@ -10,6 +10,7 @@ global LLM translation settings & target languages) from a single console.
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import uvicorn
 
 from core.config import (
     CACHE_DIR,
+    ROOT_DIR,
     AppConfig,
     ProxyEntry,
     TranslationSettings,
@@ -35,6 +37,88 @@ from core.config import (
 from core.engine import create_proxy_app
 from core.shadow_cache import ShadowStore, create_store
 from core.translator import SUPPORTED_LANGUAGES, Translator, TranslatorConfig
+
+
+# --------------------------------------------------------------------------- #
+# Process / port helpers (safe: never touch programs that are not ours)
+# --------------------------------------------------------------------------- #
+
+# Under pythonw.exe every child console program would flash a black window.
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+_OWN_PYTHON_DIR = os.path.normcase(os.path.join(ROOT_DIR, "python")) + os.sep
+
+
+def _process_exe(pid: int) -> str:
+    """Full executable path of *pid* ('' if unknown or access denied)."""
+    if os.name != "nt":
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return ""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wintypes.HANDLE
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _is_ours(pid: int) -> bool:
+    """True if *pid* runs the bundled Python of THIS Proxy Station folder."""
+    raw = _process_exe(pid)
+    if not raw:
+        return False
+    return os.path.normcase(os.path.abspath(raw)).startswith(_OWN_PYTHON_DIR)
+
+
+def listening_pids(port: int) -> set[int]:
+    """PIDs that LISTEN on TCP *port* (client connections are ignored)."""
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano", "-p", "TCP"], text=True, errors="ignore", creationflags=_NO_WINDOW
+        )
+    except Exception:
+        return set()
+    pids: set[int] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        # TCP  <local>  <foreign>  <state>  <pid>  - listening sockets have foreign port 0
+        # (state text is localized, so it is deliberately not used).
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[2].endswith(":0"):
+            if parts[1].rsplit(":", 1)[-1] == str(port) and parts[-1].isdigit():
+                pids.add(int(parts[-1]))
+    return pids
+
+
+def kill_own_processes() -> list[str]:
+    """Force-stop every Proxy Station process of this folder except the caller."""
+    me = os.getpid()
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"], text=True, errors="ignore", creationflags=_NO_WINDOW
+        )
+    except Exception as exc:
+        return [f"[ERR] cannot list processes: {exc}"]
+    msgs: list[str] = []
+    for row in csv.reader(out.splitlines()):
+        if len(row) >= 2 and row[0].lower() in ("python.exe", "pythonw.exe") and row[1].isdigit():
+            pid = int(row[1])
+            if pid != me and _is_ours(pid):
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, creationflags=_NO_WINDOW
+                )
+                msgs.append(f"[STOP] Proxy Station process PID {pid}")
+    return msgs
 
 
 class RunningProxy:
@@ -95,25 +179,43 @@ class ProxyController:
             return s.connect_ex((check_host, port)) == 0
 
     @staticmethod
-    def free_port(port: int) -> None:
-        """Kill any external process occupying `port` on Windows."""
-        my_pid = str(os.getpid())
-        try:
-            out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
-            pids = set()
-            for line in out.splitlines():
-                if f":{port} " in line or f":{port}\t" in line:
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        pid = parts[-1]
-                        if pid.isdigit() and pid != "0" and pid != my_pid:
-                            pids.add(pid)
-            for pid in pids:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", pid], capture_output=True)
-        except Exception:
-            pass
+    def reclaim_port(port: int) -> tuple[bool, str]:
+        """Free *port* ONLY if a leftover Proxy Station process of this folder holds it.
+
+        A foreign program is never killed - the user gets a clear message instead.
+        """
+        me = os.getpid()
+        pids = {p for p in listening_pids(port) if p != me}
+        if not pids:
+            return True, ""
+        foreign = [p for p in pids if not _is_ours(p)]
+        if foreign:
+            name = os.path.basename(_process_exe(foreign[0])) or "unknown program"
+            return False, (
+                f"Port {port} is occupied by another program ({name}, PID {foreign[0]}). "
+                f"Close it or choose a different port for this gateway."
+            )
+        for pid in pids:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, creationflags=_NO_WINDOW)
+        for _ in range(25):
+            if not (listening_pids(port) - {me}):
+                return True, ""
+            time.sleep(0.2)
+        return False, f"Port {port} did not become free."
 
     def start_proxy(self, proxy_id: str, force_free_port: bool = False) -> tuple[bool, str]:
+        """Start one gateway.  Never raises: every failure comes back as (False, reason).
+
+        ``force_free_port`` means "reclaim the port from a leftover Proxy Station
+        process of this folder"; foreign programs are never killed.
+        """
+        try:
+            return self._start_proxy(proxy_id, force_free_port)
+        except Exception as exc:  # surface the reason in the UI instead of dying silently
+            print(f"[ERROR] start '{proxy_id}': {exc!r}")
+            return False, f"Proxy '{proxy_id}' failed to start: {exc}"
+
+    def _start_proxy(self, proxy_id: str, force_free_port: bool) -> tuple[bool, str]:
         if proxy_id in self.running and self.running[proxy_id].is_alive:
             return False, f"Proxy '{proxy_id}' is already running on port {self.running[proxy_id].entry.listen_port}."
 
@@ -121,15 +223,20 @@ class ProxyController:
         if entry is None:
             return False, f"Proxy '{proxy_id}' not found."
 
-        if self.is_port_in_use(entry.listen_port, entry.listen_host):
-            if force_free_port:
-                self.free_port(entry.listen_port)
-                time.sleep(0.5)
-            else:
-                return (
-                    False,
-                    f"Port {entry.listen_port} is already in use by another process (use Restart/Force or free the port).",
-                )
+        port, host = entry.listen_port, entry.listen_host
+        if self.is_port_in_use(port, host):
+            if os.getpid() in listening_pids(port):
+                # Our own previous server is still closing its sockets - give it time.
+                for _ in range(60):
+                    if not self.is_port_in_use(port, host):
+                        break
+                    time.sleep(0.1)
+            if self.is_port_in_use(port, host):
+                if not force_free_port:
+                    return False, f"Port {port} is already in use by another process."
+                ok, why = self.reclaim_port(port)
+                if not ok:
+                    return False, why
 
         store = create_store(entry.id)
         translator = self.get_translator()
@@ -140,33 +247,41 @@ class ProxyController:
 
         uv_cfg = uvicorn.Config(
             app,
-            host=entry.listen_host,
-            port=entry.listen_port,
+            host=host,
+            port=port,
+            log_config=None,              # no dictConfig: works without a console (pythonw)
             log_level="warning",
             access_log=False,
+            timeout_graceful_shutdown=3,  # stop quickly even with a stream in flight
         )
         server = uvicorn.Server(uv_cfg)
+        errors: list[str] = []
 
         def _run() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(server.serve())
-            except Exception as exc:
-                print(f"\n[ERROR] Proxy '{entry.id}' crashed: {exc}")
+            except BaseException as exc:  # uvicorn exits with SystemExit on bind errors
+                errors.append(str(exc) or type(exc).__name__)
+                print(f"\n[ERROR] Proxy '{entry.id}' crashed: {exc!r}")
             finally:
                 loop.close()
 
         thread = threading.Thread(target=_run, name=f"proxy-{entry.id}", daemon=True)
         thread.start()
 
-        # Wait briefly for port to bind
-        for _ in range(25):
-            if self.is_port_in_use(entry.listen_port, entry.listen_host):
+        # Wait until uvicorn reports a completed startup (or died trying).
+        for _ in range(80):
+            if server.started:
                 break
             if not thread.is_alive():
-                return False, f"Proxy '{entry.id}' failed to bind to {entry.listen_host}:{entry.listen_port}."
+                detail = f" ({errors[0]})" if errors else ""
+                return False, f"Proxy '{entry.id}' failed to bind to {host}:{port}{detail}."
             time.sleep(0.1)
+        else:
+            server.should_exit = True
+            return False, f"Proxy '{entry.id}' did not start within 8 s."
 
         self.running[proxy_id] = RunningProxy(
             entry=entry,
@@ -175,7 +290,7 @@ class ProxyController:
             store=store,
             translator=translator,
         )
-        return True, f"Started '{entry.name}' on http://{entry.listen_host}:{entry.listen_port}/v1 -> {entry.upstream_url}"
+        return True, f"Started '{entry.name}' on http://{host}:{port}/v1 -> {entry.upstream_url}"
 
     def stop_proxy(self, proxy_id: str) -> tuple[bool, str]:
         rp = self.running.get(proxy_id)
@@ -184,7 +299,7 @@ class ProxyController:
             return False, f"Proxy '{proxy_id}' is not running."
 
         rp.server.should_exit = True
-        rp.thread.join(timeout=4.0)
+        rp.thread.join(timeout=6.0)
         self.running.pop(proxy_id, None)
         return True, f"Stopped '{rp.entry.name}' (port {rp.entry.listen_port})."
 
@@ -204,10 +319,15 @@ class ProxyController:
         return msgs
 
     def stop_all(self) -> list[str]:
+        """Stop every running gateway; all servers shut down in parallel."""
         msgs: list[str] = []
-        for pid in list(self.running.keys()):
-            ok, msg = self.stop_proxy(pid)
-            msgs.append(f"[{'OK' if ok else 'INFO'}] {msg}")
+        live = [(pid, rp) for pid, rp in self.running.items() if rp.is_alive]
+        for _, rp in live:
+            rp.server.should_exit = True
+        for pid, rp in live:
+            rp.thread.join(timeout=6.0)
+            msgs.append(f"[OK] Stopped '{rp.entry.name}' (port {rp.entry.listen_port}).")
+        self.running.clear()
         return msgs
 
 
@@ -583,13 +703,26 @@ def run_headless(ctrl: ProxyController) -> None:
 
 
 def main() -> None:
-    ctrl = ProxyController()
     args = [a.lower() for a in sys.argv[1:]]
-    if "--headless" in args or "serve" in args:
-        run_headless(ctrl)
-    elif "--status" in args or "status" in args:
+    if "--stop-all" in args or "stop-all" in args:
+        msgs = kill_own_processes()
+        print("\n".join(msgs) if msgs else "Proxy Station is not running.")
+        return
+    if "--status" in args or "status" in args:
+        ctrl = ProxyController()
         _print_proxies_table(ctrl)
         action_view_stats(ctrl)
+        return
+
+    from core import instance
+
+    if not instance.acquire():
+        instance.notify_already_running(gui=False)
+        sys.exit(1)
+
+    ctrl = ProxyController()
+    if "--headless" in args or "serve" in args:
+        run_headless(ctrl)
     elif "--no-autostart" in args:
         interactive_menu(ctrl, auto_start_on_boot=False)
     else:

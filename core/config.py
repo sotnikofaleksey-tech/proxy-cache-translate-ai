@@ -37,7 +37,9 @@ DATA_DIR = _get_data_root()                                             # пол
 
 CONFIG_DIR = os.path.join(DATA_DIR, 'config')
 CACHE_DIR = os.path.join(DATA_DIR, 'cache')
+LOG_DIR = os.path.join(DATA_DIR, 'logs')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'proxies.json')
+LOG_FILE = os.path.join(LOG_DIR, 'proxystation.log')
 
 # ---------------------------------------------------------------------------
 # Data classes
