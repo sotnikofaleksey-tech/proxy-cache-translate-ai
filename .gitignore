@@ -1,0 +1,30 @@
+# Portable Python runtime (600+ MB) — download via setup.bat
+python/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test files
+test_*.py
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary downloads
+python-embed.zip
+get-pip.py
