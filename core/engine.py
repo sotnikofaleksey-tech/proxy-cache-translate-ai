@@ -119,7 +119,6 @@ def create_proxy_app(
         fwd_headers = _forward_headers(request, upstream_api_key)
         resp_headers: dict[str, str] = {"x-shadow-upstream": upstream_url}
         if prefix_matched: resp_headers["x-shadow-prefix-matched"] = "true"
-        if prompt_en is not None: resp_headers["x-shadow-prompt-en"] = prompt_en[:200]
         timeout = _TIMEOUT_STREAM if stream else _TIMEOUT_NORMAL
         if not stream:
             return await _handle_non_stream(body, fwd_headers, upstream_url, timeout, translate_enabled and not bypass, translator, store, translate_to, session_id, resp_headers)
@@ -143,7 +142,6 @@ def create_proxy_app(
         fwd_headers = _forward_headers_anthropic(request, upstream_api_key)
         resp_headers: dict[str, str] = {"x-shadow-upstream": upstream_url}
         if prefix_matched: resp_headers["x-shadow-prefix-matched"] = "true"
-        if prompt_en is not None: resp_headers["x-shadow-prompt-en"] = prompt_en[:200]
         timeout = _TIMEOUT_STREAM if stream else _TIMEOUT_NORMAL
         if not stream:
             return await _handle_anthropic_non_stream(body, fwd_headers, upstream_url, timeout, translate_enabled and not bypass, translator, store, translate_to, session_id, resp_headers)
@@ -311,9 +309,19 @@ async def _handle_non_stream(
     store: ShadowStore | None, target_lang: str, session_id: str,
     resp_headers: dict[str, str],
 ) -> JSONResponse:
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(f"{upstream_url}/v1/chat/completions", json=body, headers=headers)
-    data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{upstream_url}/v1/chat/completions", json=body, headers=headers)
+    except httpx.TimeoutException:
+        return JSONResponse({"error": {"message": "Proxy: upstream request timed out", "type": "timeout_error"}}, status_code=504)
+    except Exception as exc:
+        return JSONResponse({"error": {"message": f"Proxy: upstream connection failed: {exc}", "type": "upstream_error"}}, status_code=502)
+
+    try:
+        data = resp.json()
+    except Exception:
+        return JSONResponse({"error": {"message": f"Upstream error {resp.status_code}: {resp.text}", "type": "upstream_error"}}, status_code=resp.status_code)
+
     translated = False
     for choice in data.get("choices", []):
         msg = choice.get("message", {})
@@ -346,15 +354,62 @@ async def _handle_openai_stream(
     in_code_block = False
     meta: dict[str, Any] = {}
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", f"{upstream_url}/v1/chat/completions", json=body, headers=headers) as resp:
-            async for raw_line in resp.aiter_lines():
-                if not raw_line.startswith("data: "):
-                    if raw_line.strip(): yield raw_line + "\n\n"
-                    continue
-                payload = raw_line[6:].strip()
-                if payload == "[DONE]":
-                    if translating:
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", f"{upstream_url}/v1/chat/completions", json=body, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    err_bytes = await resp.aread()
+                    err_msg = err_bytes.decode("utf-8", errors="replace")
+                    yield f"data: {json.dumps({'error': {'message': f'Upstream error ({resp.status_code}): {err_msg}'}})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                async for raw_line in resp.aiter_lines():
+                    if not raw_line.startswith("data: "):
+                        if raw_line.strip(): yield raw_line + "\n\n"
+                        continue
+                    payload = raw_line[6:].strip()
+                    if payload == "[DONE]":
+                        if translating:
+                            if content_buf:
+                                text, ms = await _translate_timed(translator, content_buf, target_lang)
+                                content_buf = ""; ru_full += text
+                                async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="content", meta=meta): yield ev
+                            if reasoning_buf:
+                                text, ms = await _translate_timed(translator, reasoning_buf, target_lang)
+                                reasoning_buf = ""
+                                async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="reasoning_content", meta=meta): yield ev
+                        yield "data: [DONE]\n\n"
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except json.JSONDecodeError:
+                        yield raw_line + "\n\n"
+                        continue
+                    for k in ("id", "model", "created"):
+                        if k in chunk: meta[k] = chunk[k]
+                    choices = chunk.get("choices", [])
+                    if not choices: yield raw_line + "\n\n"; continue
+                    delta = choices[0].get("delta", {})
+                    finish = choices[0].get("finish_reason")
+                    rc = delta.get("reasoning_content", "")
+                    ct = delta.get("content", "")
+                    if not translating:
+                        yield raw_line + "\n\n"
+                        continue
+                    if rc:
+                        reasoning_buf += rc
+                        text, reasoning_buf, ms = await _flush_buffer_async(reasoning_buf, False, translator, target_lang)
+                        if text:
+                            async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="reasoning_content", meta=meta): yield ev
+                    if ct:
+                        en_full += ct
+                        content_buf += ct
+                        if _CODE_FENCE in ct: in_code_block = not in_code_block
+                        text, content_buf, ms = await _flush_buffer_async(content_buf, in_code_block, translator, target_lang)
+                        if text:
+                            ru_full += text
+                            async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="content", meta=meta): yield ev
+                    if finish:
                         if content_buf:
                             text, ms = await _translate_timed(translator, content_buf, target_lang)
                             content_buf = ""; ru_full += text
@@ -363,49 +418,15 @@ async def _handle_openai_stream(
                             text, ms = await _translate_timed(translator, reasoning_buf, target_lang)
                             reasoning_buf = ""
                             async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="reasoning_content", meta=meta): yield ev
-                    yield "data: [DONE]\n\n"
-                    break
-                try:
-                    chunk = json.loads(payload)
-                except json.JSONDecodeError:
-                    yield raw_line + "\n\n"
-                    continue
-                for k in ("id", "model", "created"):
-                    if k in chunk: meta[k] = chunk[k]
-                choices = chunk.get("choices", [])
-                if not choices: yield raw_line + "\n\n"; continue
-                delta = choices[0].get("delta", {})
-                finish = choices[0].get("finish_reason")
-                rc = delta.get("reasoning_content", "")
-                ct = delta.get("content", "")
-                if not translating:
-                    yield raw_line + "\n\n"
-                    continue
-                if rc:
-                    reasoning_buf += rc
-                    text, reasoning_buf, ms = await _flush_buffer_async(reasoning_buf, False, translator, target_lang)
-                    if text:
-                        async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="reasoning_content", meta=meta): yield ev
-                if ct:
-                    en_full += ct
-                    content_buf += ct
-                    if _CODE_FENCE in ct: in_code_block = not in_code_block
-                    text, content_buf, ms = await _flush_buffer_async(content_buf, in_code_block, translator, target_lang)
-                    if text:
-                        ru_full += text
-                        async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="content", meta=meta): yield ev
-                if finish:
-                    if content_buf:
-                        text, ms = await _translate_timed(translator, content_buf, target_lang)
-                        content_buf = ""; ru_full += text
-                        async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="content", meta=meta): yield ev
-                    if reasoning_buf:
-                        text, ms = await _translate_timed(translator, reasoning_buf, target_lang)
-                        reasoning_buf = ""
-                        async for ev in _drip_words(text, ms, _sse_openai_delta, smooth_drip, field="reasoning_content", meta=meta): yield ev
-                    yield raw_line + "\n\n"
-                elif not rc and not ct:
-                    yield raw_line + "\n\n"
+                        yield raw_line + "\n\n"
+                    elif not rc and not ct:
+                        yield raw_line + "\n\n"
+    except httpx.TimeoutException:
+        yield f"data: {json.dumps({'error': {'message': 'Proxy error: Upstream timed out.'}})}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': {'message': f'Proxy upstream error: {exc}'}})}\n\n"
+        yield "data: [DONE]\n\n"
 
     if store and translating and en_full:
         store.record_turn(session_id, "assistant", ru_full, en_full)
@@ -421,9 +442,19 @@ async def _handle_anthropic_non_stream(
     store: ShadowStore | None, target_lang: str, session_id: str,
     resp_headers: dict[str, str],
 ) -> JSONResponse:
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(f"{upstream_url}/v1/messages", json=body, headers=headers)
-    data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{upstream_url}/v1/messages", json=body, headers=headers)
+    except httpx.TimeoutException:
+        return JSONResponse({"type": "error", "error": {"type": "timeout_error", "message": "Proxy: upstream request timed out"}}, status_code=504)
+    except Exception as exc:
+        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": f"Proxy: upstream connection failed: {exc}"}}, status_code=502)
+
+    try:
+        data = resp.json()
+    except Exception:
+        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": f"Upstream error {resp.status_code}: {resp.text}"}}, status_code=resp.status_code)
+
     translated = False
     for block in data.get("content", []):
         btype = block.get("type", "")
@@ -454,61 +485,77 @@ async def _handle_anthropic_stream(
     in_code_block = False
     block_index = 0
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", f"{upstream_url}/v1/messages", json=body, headers=headers) as resp:
-            event_type: str | None = None
-            async for raw_line in resp.aiter_lines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if line.startswith("event: "):
-                    # Defer: the header is re-emitted together with its data frame.
-                    event_type = line[7:].strip()
-                    continue
-                if not line.startswith("data: "):
-                    yield line + "\n"
-                    continue
-                payload = line[6:]
-                try:
-                    data = json.loads(payload)
-                except json.JSONDecodeError:
-                    yield _sse_raw(event_type, payload); event_type = None; continue
-                ev_name = event_type or data.get("type")
-                if isinstance(data.get("index"), int):
-                    block_index = data["index"]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", f"{upstream_url}/v1/messages", json=body, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    err_bytes = await resp.aread()
+                    err_text = err_bytes.decode("utf-8", errors="replace")
+                    try:
+                        err_json = json.loads(err_text)
+                    except Exception:
+                        err_json = {"type": "error", "error": {"type": "api_error", "message": f"Upstream error ({resp.status_code}): {err_text}"}}
+                    yield f"event: error\ndata: {json.dumps(err_json, ensure_ascii=False)}\n\n"
+                    return
+                event_type: str | None = None
+                async for raw_line in resp.aiter_lines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("event: "):
+                        # Defer: the header is re-emitted together with its data frame.
+                        event_type = line[7:].strip()
+                        continue
+                    if not line.startswith("data: "):
+                        yield line + "\n"
+                        continue
+                    payload = line[6:]
+                    try:
+                        data = json.loads(payload)
+                    except json.JSONDecodeError:
+                        yield _sse_raw(event_type, payload); event_type = None; continue
+                    ev_name = event_type or data.get("type")
+                    if isinstance(data.get("index"), int):
+                        block_index = data["index"]
 
-                if ev_name == "content_block_delta" and translating:
-                    delta = data.get("delta", {})
-                    dtype = delta.get("type", "")
-                    if dtype == "text_delta":
-                        fragment = delta.get("text", "")
-                        en_full += fragment
-                        text_buf += fragment
-                        if _CODE_FENCE in fragment: in_code_block = not in_code_block
-                        text, text_buf, ms = await _flush_buffer_async(text_buf, in_code_block, translator, target_lang)
-                        if text:
-                            ru_full += text
+                    if ev_name == "content_block_delta" and translating:
+                        delta = data.get("delta", {})
+                        dtype = delta.get("type", "")
+                        if dtype == "text_delta":
+                            fragment = delta.get("text", "")
+                            en_full += fragment
+                            text_buf += fragment
+                            if _CODE_FENCE in fragment: in_code_block = not in_code_block
+                            text, text_buf, ms = await _flush_buffer_async(text_buf, in_code_block, translator, target_lang)
+                            if text:
+                                ru_full += text
+                                async for ev in _drip_words(text, ms, _sse_anthropic_delta, smooth_drip, delta_type="text_delta", index=block_index): yield ev
+                        elif dtype == "thinking_delta":
+                            thinking_buf += delta.get("thinking", "")
+                            text, thinking_buf, ms = await _flush_buffer_async(thinking_buf, False, translator, target_lang)
+                            if text:
+                                async for ev in _drip_words(text, ms, _sse_anthropic_delta, smooth_drip, delta_type="thinking_delta", field="thinking", index=block_index): yield ev
+                        else:
+                            yield _sse_raw(ev_name, payload)
+                    elif ev_name == "content_block_stop" and translating:
+                        if text_buf:
+                            text, ms = await _translate_timed(translator, text_buf, target_lang)
+                            text_buf = ""; ru_full += text
                             async for ev in _drip_words(text, ms, _sse_anthropic_delta, smooth_drip, delta_type="text_delta", index=block_index): yield ev
-                    elif dtype == "thinking_delta":
-                        thinking_buf += delta.get("thinking", "")
-                        text, thinking_buf, ms = await _flush_buffer_async(thinking_buf, False, translator, target_lang)
-                        if text:
+                        if thinking_buf:
+                            text, ms = await _translate_timed(translator, thinking_buf, target_lang)
+                            thinking_buf = ""
                             async for ev in _drip_words(text, ms, _sse_anthropic_delta, smooth_drip, delta_type="thinking_delta", field="thinking", index=block_index): yield ev
+                        yield _sse_raw(ev_name, payload)
                     else:
                         yield _sse_raw(ev_name, payload)
-                elif ev_name == "content_block_stop" and translating:
-                    if text_buf:
-                        text, ms = await _translate_timed(translator, text_buf, target_lang)
-                        text_buf = ""; ru_full += text
-                        async for ev in _drip_words(text, ms, _sse_anthropic_delta, smooth_drip, delta_type="text_delta", index=block_index): yield ev
-                    if thinking_buf:
-                        text, ms = await _translate_timed(translator, thinking_buf, target_lang)
-                        thinking_buf = ""
-                        async for ev in _drip_words(text, ms, _sse_anthropic_delta, smooth_drip, delta_type="thinking_delta", field="thinking", index=block_index): yield ev
-                    yield _sse_raw(ev_name, payload)
-                else:
-                    yield _sse_raw(ev_name, payload)
-                event_type = None
+                    event_type = None
+    except httpx.TimeoutException:
+        err_json = {"type": "error", "error": {"type": "timeout_error", "message": "Proxy error: Upstream timed out."}}
+        yield f"event: error\ndata: {json.dumps(err_json, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        err_json = {"type": "error", "error": {"type": "api_error", "message": f"Proxy upstream error: {exc}"}}
+        yield f"event: error\ndata: {json.dumps(err_json, ensure_ascii=False)}\n\n"
 
     if store and translating and en_full:
         store.record_turn(session_id, "assistant", ru_full, en_full)
